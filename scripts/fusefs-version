@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Manual file-version history for a mounted FuseFS filesystem."""
+import argparse
+import hashlib
+import os
+import shutil
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+STORE_NAME = ".fusefs_versions"
+
+
+def resolve_target(mount_arg: str, file_arg: str):
+    mount = Path(mount_arg).resolve(strict=True)
+    if not mount.is_dir():
+        raise ValueError(f"Mount point is not a directory: {mount}")
+    target_arg = Path(file_arg)
+    target = (mount / target_arg).resolve(strict=True) if not target_arg.is_absolute() else target_arg.resolve(strict=True)
+    try:
+        relative = target.relative_to(mount)
+    except ValueError:
+        raise ValueError("File must be inside the supplied mount point")
+    if relative.parts and relative.parts[0] == STORE_NAME:
+        raise ValueError(f"The reserved {STORE_NAME} directory cannot be versioned")
+    if not target.is_file():
+        raise ValueError(f"Target must be an existing regular file: {target}")
+    return mount, target, relative.as_posix()
+
+
+def paths_for(mount: Path, relative: str):
+    key = hashlib.sha256(relative.encode("utf-8")).hexdigest()
+    folder = mount / STORE_NAME / key
+    return folder, key
+
+
+def snapshot(mount: Path, target: Path, relative: str):
+    folder, _ = paths_for(mount, relative)
+    folder.mkdir(parents=True, exist_ok=True)
+    version = f"{time.time_ns()}"
+    final = folder / f"{version}.snapshot"
+    fd, tmp_name = tempfile.mkstemp(prefix=".snapshot-", dir=folder)
+    os.close(fd)
+    try:
+        shutil.copy2(target, tmp_name)
+        os.replace(tmp_name, final)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    print(f"Saved version {version} ({final.stat().st_size} bytes) for {relative}")
+
+
+def list_versions(mount: Path, relative: str):
+    folder, _ = paths_for(mount, relative)
+    versions = sorted(folder.glob("*.snapshot"), key=lambda p: p.name, reverse=True) if folder.exists() else []
+    if not versions:
+        print(f"No saved versions for {relative}")
+        return
+    print(f"Saved versions for {relative} (newest first):")
+    for idx, path in enumerate(versions, 1):
+        stamp = int(path.stem)
+        readable = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp / 1_000_000_000))
+        print(f"  {idx}. ID {path.stem} | {readable} | {path.stat().st_size} bytes")
+
+
+def restore(mount: Path, target: Path, relative: str, version: str):
+    folder, _ = paths_for(mount, relative)
+    source = folder / f"{version}.snapshot"
+    if not source.is_file():
+        raise ValueError(f"Saved version {version!r} not found; run 'list' to see available IDs")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.restore-", dir=target.parent)
+    os.close(fd)
+    try:
+        shutil.copy2(source, tmp_name)
+        os.replace(tmp_name, target)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    print(f"Restored version {version} to {relative}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create and manage manual file versions on a mounted FuseFS volume")
+    parser.add_argument("action", choices=("snapshot", "list", "restore"))
+    parser.add_argument("mountpoint", help="FuseFS mount point")
+    parser.add_argument("file", help="file path, absolute or relative to mount point")
+    parser.add_argument("version", nargs="?", help="version ID required by restore")
+    args = parser.parse_args()
+    if args.action == "restore" and not args.version:
+        parser.error("restore requires a version ID; use the list action to find one")
+    if args.action != "restore" and args.version:
+        parser.error("version ID is only accepted with restore")
+    try:
+        mount, target, relative = resolve_target(args.mountpoint, args.file)
+        if args.action == "snapshot":
+            snapshot(mount, target, relative)
+        elif args.action == "list":
+            list_versions(mount, relative)
+        else:
+            restore(mount, target, relative, args.version)
+    except (OSError, ValueError) as exc:
+        print(f"fusefs-version: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
